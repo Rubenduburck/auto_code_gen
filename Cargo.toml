@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+name = "codegen"
+members = ["crates/*"]
+
+[workspace.package]
+name = "rgpt"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/rubenduburck/rgpt"
+
+[workspace.dependencies]
+rgpt-provider = { path = "../rgpt/crates/provider" }
+rgpt-types = { path = "../rgpt/crates/types" }
+chrono = "0.4.38"
+
+# Logging
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
+
+thiserror = "1.0.30"
+
+tokio = { version = "1.16.1", features = ["full"] }
+tokio-stream = "0.1.15"
