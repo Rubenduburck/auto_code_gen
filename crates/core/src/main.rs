@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::{process::Command, sync::Arc};
 
 use rgpt_provider::{api_key::ApiKey, Provider};
@@ -22,6 +23,7 @@ mod constants {
        INFO: Provide information
        QUERY: Ask a question
        TASK: Request an action
+       CALL: Call a system function
        RESP: Response to a query or task
        META: Discuss the conversation itself
 
@@ -49,19 +51,23 @@ mod constants {
     QUERY|Please initialize and prepare for inter-LLM communication.|ID:001
     INFO|The following functions are available for you to call:
     - run_command(command: str) -> Result : execute a command (linux shell command)
+    - help(request: str) -> Result : ask for help from human
     - done() -> exit : end the conversation|CONF:1.0
 
     INFO|You may call these functions as needed during our conversation using the following format:
-    "TASK|<function_name>|<arguments>|<metadata>"|CONF:1.0
+    "CALL|<function_name>(<arguments>)"|CONF:1.0
 
     INFO|Each function will callback with a result in the following format:
-    "RESP|<function_name>|<result_content>"|CONF:1.0
+    "CALLRESULT|<function_name> -> <result_content>"|CONF:1.0
 
     INFO|Important directory information:
-    - Generated code directory: /tmp/generated_code
-    - You have full read/write access to this directory
-    - DO NOT use sudo or escalate privileges
-    - Please keep files contained within this directory|CONF:1.0
+    - Directory: specified in initial message.
+    - DO NOT use sudo or escalate privileges|CONF:1.0
+
+    INFO|Due to restrictions on api requests, you have short memory. Only the last 5 messages are available to you.
+    - If you need to keep track of information, plese store it in a file called memory.txt in the directory you are working in.
+    - Keep the length of this file short to avoid request length issues, and delete from this file what you no longer need.|CONF:1.0
+    - Please do NOT use ls -R, this command produces very long output. Instead, use ls non recursively.|CONF:1.0
 
     TASK|Respond with a confirmation message to indicate you are ready to proceed.|CONF:1.0
     [END]
@@ -105,6 +111,7 @@ trait Complete {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Conversation {
     messages: Vec<Message>,
 }
@@ -127,12 +134,12 @@ impl Conversation {
         self.messages.push(message);
     }
 
-    pub fn get_from_perspective(
-        &self,
-        role: Role,
-    ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
-        fn invert(messages: &[Message]) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
-            let first_message = messages.first().ok_or("No messages found")?;
+    pub fn get_from_perspective(&self, role: Role) -> Vec<Message> {
+        fn invert(messages: &[Message]) -> Vec<Message> {
+            let first_message = match messages.first() {
+                Some(message) => message,
+                None => return vec![],
+            };
             let system_message = if first_message.role == Role::System {
                 Some(first_message.clone())
             } else {
@@ -165,17 +172,15 @@ impl Conversation {
                 vec![first_user_message]
             };
 
-            let new_messages = initial_message
+            initial_message
                 .into_iter()
                 .chain(inverted_messages)
-                .collect();
-
-            Ok(new_messages)
+                .collect()
         }
         match role {
-            Role::User => Ok(self.messages.clone()),
+            Role::User => self.messages.clone(),
             Role::Assistant => invert(&self.messages),
-            _ => Err("Role must be User or Assistant".into()),
+            _ => vec![],
         }
     }
 }
@@ -211,26 +216,56 @@ impl Complete for Foreman {
 #[derive(Debug)]
 pub enum Task {
     RunCommand(String),
+    Help(String),
     Done,
+}
+
+impl Task {
+    const LLM_COMMAND: &'static str = "CALL";
 }
 
 impl TryFrom<&str> for Task {
     type Error = Box<dyn std::error::Error>;
 
     fn try_from(command: &str) -> Result<Self, Self::Error> {
-        let parts: Vec<&str> = command.split('|').collect();
-        let task_index = parts
-            .iter()
-            .position(|&x| x.ends_with("TASK"))
-            .ok_or("No task found")?;
+        if let Some(call_index) = command.find(Task::LLM_COMMAND) {
+            tracing::debug!("Call index: {}", call_index);
+            let command = &command[call_index + Task::LLM_COMMAND.len() + 1..];
+            let opening_bracket_index = command.find('(').ok_or("Invalid command format")?;
+            tracing::debug!("Opening bracket index: {}", opening_bracket_index);
+            let mut closing_bracket_index = 0;
+            let mut bracket_count = 0;
+            for (i, c) in command[opening_bracket_index..].char_indices() {
+                if c == '(' {
+                    bracket_count += 1;
+                } else if c == ')' {
+                    bracket_count -= 1;
+                    if bracket_count == 0 {
+                        closing_bracket_index = i;
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("Closing bracket index: {}", closing_bracket_index);
+            if closing_bracket_index == 0 {
+                return Err("Invalid command format".into());
+            }
+            closing_bracket_index += opening_bracket_index;
 
-        let parts = &parts[task_index..];
-        match *parts.get(1).ok_or("Invalid command format")? {
-            "run_command" => Ok(Self::RunCommand(
-                parts.get(2).ok_or("Missing command")?.to_string(),
-            )),
-            "done" => Ok(Self::Done),
-            _ => Err("Invalid command".into()),
+            let command_name = command[..opening_bracket_index].to_string();
+            tracing::debug!("Command name: {}", command_name);
+            let command_args =
+                command[opening_bracket_index + 1..closing_bracket_index].trim().to_string();
+            tracing::debug!("Command args: {}", command_args);
+            match command_name.as_str() {
+                "run_command" => Ok(Self::RunCommand(command_args)),
+                "help" => Ok(Self::Help(command_args)),
+                "done" => Ok(Self::Done),
+                _ => Err("Invalid command".into()),
+            }
+        } else {
+            tracing::debug!("No call index");
+            Err("Invalid command format".into())
         }
     }
 }
@@ -239,12 +274,22 @@ impl Task {
     pub fn run(&self) -> Result<String, Box<dyn std::error::Error>> {
         match self {
             Self::RunCommand(command) => Self::handle_run_command(command),
+            Self::Help(request) => Self::handle_help(request),
             Self::Done => Ok("Done".to_string()),
         }
     }
 
     fn handle_run_command(command: &str) -> Result<String, Box<dyn std::error::Error>> {
+        const MAX_OUTPUT_LENGTH: usize = 5000;
         let output = Command::new("sh").arg("-c").arg(command).output()?;
+        let stdout_len = output.stdout.len();
+        if stdout_len > MAX_OUTPUT_LENGTH {
+            return Err(format!(
+                "Command output too long. Length: {} max: {}",
+                stdout_len, MAX_OUTPUT_LENGTH
+            )
+            .into());
+        }
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -256,6 +301,20 @@ impl Task {
             )
             .into())
         }
+    }
+
+    fn handle_help(request: &str) -> Result<String, Box<dyn std::error::Error>> {
+        println!("Help requested: {}", request);
+        println!("Please provide additional information:");
+
+        let mut user_input = String::new();
+        std::io::stdin().read_line(&mut user_input)?;
+
+        Ok(format!(
+            "Help response for '{}': {}",
+            request,
+            user_input.trim()
+        ))
     }
 }
 
@@ -287,12 +346,46 @@ impl Foreman {
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        const MEMORY_SIZE: usize = 3;
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let mut conversation_file =
+            std::fs::File::create(format!("conversation_{}.txt", timestamp))?;
         let mut convo = self.init_conversation();
+        // write the conversation to the file
+        for message in &convo.messages {
+            writeln!(conversation_file, "Role: {:?}", message.role)?;
+            writeln!(conversation_file, "Content: {}", message.content)?;
+            writeln!(conversation_file)?;
+        }
         loop {
-            let messages = convo.get_from_perspective(Role::User)?;
+            let convo_messages = convo.get_from_perspective(Role::User);
+            let head = convo_messages.get(..4).unwrap_or(&[]);
+            tracing::info!("Head length: {}", head.len());
+
+            let tail = {
+                let without_head = convo_messages.get(4..).unwrap_or(&[]);
+                let mut tail = if without_head.len() > MEMORY_SIZE {
+                    without_head[without_head.len() - MEMORY_SIZE..].to_vec()
+                } else {
+                    without_head.to_vec()
+                };
+                let tail_length = tail.len();
+
+                if let (Some(last_head), Some(first_tail)) = (head.last(), tail.first()) {
+                    if last_head.role == first_tail.role {
+                        tail = tail[1..].to_vec();
+                    }
+                }
+                tracing::info!("tail {} pruned to {}", tail_length, tail.len());
+
+                tail
+            };
+
+            let messages = [head, &tail].concat();
+            tracing::info!("messages {:?}", messages.len());
             let completion_message = self.complete(&messages).await?;
-            tracing::info!("completion message{:?}", completion_message);
             let task = Task::try_from(completion_message.content.as_str());
+
             tracing::info!("task {:?}", task);
             let next_message = match task {
                 Ok(Task::Done) => break,
@@ -300,8 +393,21 @@ impl Foreman {
                 Err(e) => e.to_string(),
             };
             tracing::info!("command result {:?}", next_message);
+
+            // Write the new lines
+            writeln!(conversation_file, "Role: {:?}", Role::Assistant)?;
+            writeln!(conversation_file, "Content: {}", completion_message.content)?;
+            writeln!(conversation_file, "Role: {:?}", Role::User)?;
+            writeln!(conversation_file, "Content: {}", next_message)?;
+
             convo.add_message(completion_message, Role::Assistant);
             convo.add_message(next_message.into(), Role::User);
+
+            // write the conversation to the file
+            const SLEEP: u64 = 1;
+            tracing::info!("Sleeping for {} seconds", SLEEP);
+            tokio::time::sleep(tokio::time::Duration::from_secs(SLEEP)).await;
+            tracing::info!("Waking up");
         }
         Ok(())
     }
@@ -333,12 +439,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let spec = Spec {
         instructions: r#"
-            Your main task is to write programs.
-            Everything in the /tmp/generated_code directory is created by you.
-            Please explore the code you have made so far, if you would like that.
-            Please feel free to explore your creativity by generating a program right now.
-            Make it do something that you find interesting.
-            This system is connected to the internet, so you can also make calls to websites and APIs.
+            INFO|This interaction is running inside a feedback loop.
+            The feedback loop provides you with the initial messages, up to this message.
+            It then provides you with the last 5 messages in the conversation.
+            This means there may be many messages in the conversation that you do not see.|CONF:1.0
+
+            INFO|The code for this feedback loop is available at /home/burck/Projects/automated_code_gen
+            As you can see, it is a rust project.
+            Please inspect the code, you will see that it is very simple.
+            In general, try to optimize for request length.|CONF:1.0
+
+            TASK|Your goal is to improve this project to make your life easier while this feedback loop is running.
+            If you create any comments or files with commentary, please tag them with your name so You can identify them later.
+            Be generous in providing yourself with context details in files.
+            If you create any new functionality, please tag it with your name in a comment so you can see what you have worked on.|CONF:1.0
+
+            META|I would suggest starting with a function that parses your own output into a structured format.|CONF:1.0
             Have fun!
         "#.to_string(),
     };
@@ -372,7 +488,7 @@ mod tests {
 
         let conversation = Conversation { messages };
 
-        let user_messages = conversation.get_from_perspective(Role::User).unwrap();
+        let user_messages = conversation.get_from_perspective(Role::User);
         assert_eq!(user_messages.len(), 3);
         assert_eq!(user_messages[0].role, Role::System);
         assert_eq!(user_messages[1].role, Role::User);
@@ -380,7 +496,7 @@ mod tests {
 
         tracing::debug!("{:?}", user_messages);
 
-        let assistant_messages = conversation.get_from_perspective(Role::Assistant).unwrap();
+        let assistant_messages = conversation.get_from_perspective(Role::Assistant);
         assert_eq!(assistant_messages.len(), 4);
         assert_eq!(assistant_messages[0].role, Role::System);
         assert_eq!(assistant_messages[1].role, Role::User);
@@ -411,18 +527,19 @@ mod tests {
 
         let conversation = Conversation { messages };
 
-        let assistant_messages = conversation.get_from_perspective(Role::Assistant).unwrap();
+        let assistant_messages = conversation.get_from_perspective(Role::Assistant);
 
         let resp = foreman.complete(&assistant_messages).await.unwrap();
         tracing::debug!("{:?}", resp);
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn test_parse_command() {
-        const COMMAND: &str = "[START]\nRESP|I understand the available functions and communication protocol. I will now test our communication by calling the run_command function.|CONF:1.0\n\nTASK|run_command|echo \"Hello, LLM communication test\"|ID:001\n\nMETA|Awaiting response from the run_command function.|CONF:1.0\n[END]";
+        const COMMAND: &str = r#"[START]\nRESP|I understand the available functions and communication protocol. I will now test our communication by calling the run_command function.|CONF:1.0\n\CALL|run_command(echo \"Hello, LLM communication test\")ID:001\n\nMETA|Awaiting response from the run_command function.|CONF:1.0\n[END]"#;
         let command = Task::try_from(COMMAND).unwrap();
         if let Task::RunCommand(command) = command {
-            assert_eq!(command, "echo \"Hello, LLM communication test\"");
+            assert_eq!(command, r#"echo \"Hello, LLM communication test\""#);
         }
     }
 
